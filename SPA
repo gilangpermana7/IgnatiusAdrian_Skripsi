@@ -1,0 +1,127 @@
+% spa_minimal: Hitung posisi Matahari (azimuth, elevasi, zenith) dengan akurasi ±0.5°
+% INPUT: year, month, day, hour, minute, second, timezone, latitude_deg, longitude_deg
+% OUTPUT: azimuth_deg (0°=utara, searah jarum jam), elevation_deg, zenith_deg
+% Algoritma mengikuti ringkasan Jean Meeus, cocok untuk single-axis tracker
+
+% Konstanta
+DEG2RAD = pi/180;
+RAD2DEG = 180/pi;
+
+if nargin < 9
+    % Nilai default/manual
+    year = 2025; month = 6; day = 26;
+    hour = 10; minute = 30; second = 0;
+    timezone = 7; latitude_deg = -6.969643; longitude_deg = 110.453547;
+end
+
+%% 1. Waktu lokal ke UTC (jam desimal)
+hour_utc = hour - timezone;
+minute_utc = minute;
+second_utc = second;
+
+%% 2. Julian Day (JD) klasik (Meeus, tanpa koreksi ΔT)
+if month <= 2
+    year = year - 1;
+    month = month + 12;
+end
+A = floor(year/100);
+B = 2 - A + floor(A/4);
+JD = floor(365.25*(year+4716)) + floor(30.6001*(month+1)) + day + B - 1524.5 + ...
+    (hour_utc + minute_utc/60 + second_utc/3600)/24;
+
+%% 3. Julian Century (JC)
+JC = (JD - 2451545)/36525;
+
+%% 4. Solar Geom. Mean Longitude (L0)
+L0 = 280.46646 + 36000.76983*JC + 0.0003032*JC^2;
+L0 = mod(L0,360); % deg
+
+%% 5. Solar Geom. Mean Anomaly (M)
+M = 357.52911 + 35999.05029*JC - 0.0001537*JC^2; % deg
+
+%% 6. Equation-of-Center (C)
+C = 1.914602*sin(DEG2RAD*M) + 0.019993*sin(DEG2RAD*2*M) + 0.000289*sin(DEG2RAD*3*M); % deg
+
+%% 7. True Longitude (lambda), Apparent Longitude (lambda_app)
+lambda = L0 + C; % deg
+omega = 125.04 - 1934.136*JC; % deg
+lambda_app = lambda - 0.00569 - 0.00478*sin(DEG2RAD*omega); % deg
+
+%% 8. Obliquity (epsilon)
+eps0 = 23.439292 - 0.0130042*JC; % mean obliquity, deg
+eps = eps0 + 0.00256*cos(DEG2RAD*omega); % true obliquity, deg
+
+%% 9. Solar Declination (delta)
+delta = asin( sin(DEG2RAD*eps) * sin(DEG2RAD*lambda_app) ); % rad
+
+%% 10. Equation of Time (EoT)
+e = 0.016708634;
+y = tan(DEG2RAD*eps/2)^2;
+L0_rad = DEG2RAD*L0;
+M_rad = DEG2RAD*M;
+EoT = 4*RAD2DEG*( y*sin(2*L0_rad) - 2*e*sin(M_rad) + 4*e*y*sin(M_rad).*cos(2*L0_rad) ...
+    - 0.5*y^2*sin(4*L0_rad) - 1.25*e^2*sin(2*M_rad) ); % menit
+
+%% 11. True Solar Time (TST)
+TST = mod((hour*60 + minute + second/60) + EoT + 4*longitude_deg - 60*timezone, 1440); % menit
+
+%% 12. Hour Angle (HA)
+HA = TST/4 - 180; % deg
+if HA < -180
+    HA = HA + 360;
+end
+
+%% 13. Elevation (e)
+lat_rad = DEG2RAD*latitude_deg;
+HA_rad = DEG2RAD*HA;
+sin_e = sin(lat_rad)*sin(delta) + cos(lat_rad)*cos(delta)*cos(HA_rad);
+elevation_deg = asin(sin_e)*RAD2DEG;
+
+%% 14. Zenith
+zenith_deg = 90 - elevation_deg;
+
+%% 15. Azimuth (0°=utara, searah jarum jam)
+az_rad = atan2( sin(HA_rad), cos(HA_rad)*sin(lat_rad) - tan(delta)*cos(lat_rad) );
+azimuth_deg = mod(az_rad*RAD2DEG + 180, 360);
+
+end
+
+%% Contoh pemanggilan (hapus % untuk uji coba)
+% [az,el,zen] = spa_minimal(2025,6,26,10,30,0,7, -6.2,106.8)
+
+%% Contoh: Hitung posisi Matahari setiap 15 menit, 9-18 Juni 2025, 07:00-17:00 WIB, lokasi Anda
+lat = -6.969643; lon = 110.453547; tz = 7;
+t0 = datetime(2025,6,9,7,0,0);
+t1 = datetime(2025,6,18,17,0,0);
+times = t0:minutes(15):t1;
+N = numel(times);
+azs = zeros(N,1); els = zeros(N,1); zens = zeros(N,1);
+for i = 1:N
+  [azs(i), els(i), zens(i)] = spa_minimal(year(times(i)), month(times(i)), day(times(i)), hour(times(i)), minute(times(i)), second(times(i)), tz, lat, lon);
+end
+figure; plot(times, els, '-b');
+xlabel('Waktu'); ylabel('Elevasi Matahari (deg)'); grid on;
+title('Elevasi Matahari 9-18 Juni 2025, -6.97, 110.45');
+
+% Tampilkan data di command window
+T = table(times', azs, els, zens, 'VariableNames', {'Waktu','Azimuth','Elevasi','Zenith'});
+disp(T);
+
+[az, el, zen] = spa_minimal(2025,6,26,10,30,0,7, -6.969643, 110.453547);
+disp([az, el, zen])
+
+%% Contoh: Plot azimuth, elevasi, zenith setiap 15 menit untuk 1 hari (editable)
+tanggal = [2025, 6, 9]; % Ubah ke hari yang diinginkan
+lat = -6.969643; lon = 110.453547; tz = 7;
+jam_mulai = 7; jam_selesai = 17;
+times = datetime(tanggal(1), tanggal(2), tanggal(3), jam_mulai, 0, 0):minutes(15):datetime(tanggal(1), tanggal(2), tanggal(3), jam_selesai, 0, 0);
+N = numel(times);
+azs = zeros(N,1); els = zeros(N,1); zens = zeros(N,1);
+for i = 1:N
+[azs(i), els(i), zens(i)] = spa_minimal(year(times(i)), month(times(i)), day(times(i)), hour(times(i)), minute(times(i)), second(times(i)), tz, lat, lon);
+end
+figure;
+plot(times, azs, '-r', times, els, '-b', times, zens, '-g');
+legend('Azimuth','Elevasi','Zenith');
+xlabel('Waktu'); ylabel('Sudut (deg)'); grid on;
+title(['Posisi Matahari pada ', datestr(times(1), 'dd mmm yyyy'), ' di -6.97, 110.45']);
