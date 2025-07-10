@@ -1,0 +1,222 @@
+% main_GA_FLC.m
+% Optimasi FLC Mamdani dengan GA untuk sistem kontrol solar panel hybrid
+
+clc; clear; close all;
+
+%% 1. Load Dataset
+data = readtable('transiensebelum.csv');
+delta_error = data.delta_error;
+delta_lux = data.delta_lux;
+output_target = data.output_target;
+
+%% 2. Buat FIS Awal (Mamdani)
+fis = mamfis('Name','FLC_Solar');
+
+% Input 1: delta_error
+fis = addInput(fis, [-45 45], 'Name', 'delta_error');
+% Input 2: delta_lux
+fis = addInput(fis, [0 1023], 'Name', 'delta_lux');
+% Output: sudut koreksi servo
+fis = addOutput(fis, [-10 10], 'Name', 'servo');
+
+% Membership Function Names
+mf_names = {'NB','NS','ZO','PS','PB'};
+
+% Parameter MF yang merata
+de_mf = [-45 -45 -22.5; -45 -22.5 0; -22.5 0 22.5; 0 22.5 45; 22.5 45 45];
+lux_mf = [0 0 256; 0 256 512; 256 512 768; 512 768 1023; 768 1023 1023];
+servo_mf = [-10 -10 -5; -10 -5 0; -5 0 5; 0 5 10; 5 10 10];
+
+for i=1:5
+    fis = addMF(fis, 'delta_error', 'trimf', de_mf(i,:), 'Name', mf_names{i});
+    fis = addMF(fis, 'delta_lux', 'trimf', lux_mf(i,:), 'Name', mf_names{i});
+    fis = addMF(fis, 'servo', 'trimf', servo_mf(i,:), 'Name', mf_names{i});
+end
+
+% Rule base (25 rules)
+ruleList = [
+    1 1 1 1 1; 1 2 1 1 1; 1 3 2 1 1; 1 4 2 1 1; 1 5 3 1 1;
+    2 1 1 1 1; 2 2 2 1 1; 2 3 2 1 1; 2 4 3 1 1; 2 5 4 1 1;
+    3 1 2 1 1; 3 2 2 1 1; 3 3 3 1 1; 3 4 4 1 1; 3 5 4 1 1;
+    4 1 2 1 1; 4 2 3 1 1; 4 3 4 1 1; 4 4 4 1 1; 4 5 5 1 1;
+    5 1 3 1 1; 5 2 4 1 1; 5 3 4 1 1; 5 4 5 1 1; 5 5 5 1 1;
+];
+fis = addRule(fis, ruleList);
+
+%% 3. Evaluasi FLC Sebelum Optimasi
+output_pred_before = zeros(size(delta_error));
+for i=1:length(delta_error)
+    output_pred_before(i) = evalfis(fis, [delta_error(i), delta_lux(i)]);
+end
+rmse_before = sqrt(mean((output_pred_before - output_target).^2));
+fprintf('RMSE sebelum optimasi: %.4f\n', rmse_before);
+
+%% 4. Genetic Algorithm untuk Optimasi MF
+% Kromosom: semua parameter trimf (input dan output)
+nMF = 5; nParam = 3;
+nVar = nMF*nParam*3; % 3 variabel (delta_error, delta_lux, servo)
+
+% Buat batas bawah dan atas agar MF tetap overlap dan urut
+de_lb = [-45 -45 -40  -45 -40 -20  -40 -20 0  -20 0 20  0 20 40];
+de_ub = [-40 -20 0  -20 0 20  0 20 40  20 40 45  40 45 45];
+lux_lb = [0 0 100  0 100 300  100 300 500  300 500 800  500 800 900];
+lux_ub = [100 300 500  300 500 800  500 800 900  800 900 1023  900 1023 1023];
+servo_lb = [-10 -10 -8  -10 -8 -2  -8 -2 2  -2 2 8  2 8 10];
+servo_ub = [-8 -2 2  -2 2 8  2 8 10  8 10 10  10 10 10];
+lb = [de_lb, lux_lb, servo_lb];
+ub = [de_ub, lux_ub, servo_ub];
+
+% Initial population: flatten all MF params
+x0 = [de_mf(:); lux_mf(:); servo_mf(:)]';
+
+% GA options
+popSize = 50;
+maxGen = 100;
+options = optimoptions('ga', ...
+    'PopulationSize', popSize, ...
+    'MaxGenerations', maxGen, ...
+    'CrossoverFraction', 0.8, ...
+    'MutationFcn', {@mutationgaussian, 0.1, 0.5}, ...
+    'SelectionFcn', @selectionroulette, ...
+    'Display', 'iter', ...
+    'PlotFcn', {@gaplotbestf});
+
+% Fitness function
+fitnessFcn = @(x) FLC_GA_fitness(x, fis, delta_error, delta_lux, output_target);
+
+% Run GA
+[x_opt, fval, exitflag, output, population, scores] = ga(fitnessFcn, nVar, [], [], [], [], lb, ub, [], options);
+
+%% 5. Update FIS dengan parameter hasil optimasi
+fis_opt = fis;
+idx = 1;
+eps = 1e-3; % toleransi kecil
+
+% Helper untuk validasi trimf
+function params = valid_trimf(params)
+    params = sort(params);
+    if params(1) == params(2)
+        params(2) = params(1) + eps;
+    end
+    if params(2) == params(3)
+        params(3) = params(2) + eps;
+    end
+    if params(1) == params(3)
+        params(3) = params(1) + 2*eps;
+    end
+end
+
+for i=1:5
+    params = valid_trimf(x_opt(idx:idx+2));
+    fis_opt.Inputs(1).MembershipFunctions(i).Parameters = params;
+    idx=idx+3;
+end
+for i=1:5
+    params = valid_trimf(x_opt(idx:idx+2));
+    fis_opt.Inputs(2).MembershipFunctions(i).Parameters = params;
+    idx=idx+3;
+end
+for i=1:5
+    params = valid_trimf(x_opt(idx:idx+2));
+    fis_opt.Outputs(1).MembershipFunctions(i).Parameters = params;
+    idx=idx+3;
+end
+
+%% 6. Evaluasi FLC Setelah Optimasi
+output_pred_after = zeros(size(delta_error));
+for i=1:length(delta_error)
+    output_pred_after(i) = evalfis(fis_opt, [delta_error(i), delta_lux(i)]);
+end
+rmse_after = sqrt(mean((output_pred_after - output_target).^2));
+fprintf('RMSE setelah optimasi: %.4f\n', rmse_after);
+
+%% 7. Plot Perbandingan Output
+figure;
+plot(output_target, 'ko-', 'LineWidth',1.5); hold on;
+plot(output_pred_before, 'b*-', 'LineWidth',1.5);
+plot(output_pred_after, 'r*-', 'LineWidth',1.5);
+legend('Target','FLC Awal','FLC Hasil GA');
+xlabel('Data ke-'); ylabel('Output');
+title('Perbandingan Output FLC Sebelum & Sesudah GA');
+grid on;
+
+%% 8. Simpan FIS hasil optimasi
+writeFIS(fis_opt, 'FLC_Solar_Optimized.fis');
+figure;
+subplot(3,1,1);
+plotmf(fis, 'input', 1);
+title('MF Input 1: delta\_error');
+xlabel('delta\_error'); ylabel('Degree of membership');
+legend({'NB','NS','ZO','PS','PB'}, 'Location', 'northwest');
+
+subplot(3,1,2);
+plotmf(fis, 'input', 2);
+title('MF Input 2: delta\_lux');
+xlabel('delta\_lux'); ylabel('Degree of membership');
+legend({'NB','NS','ZO','PS','PB'}, 'Location', 'northwest');
+
+subplot(3,1,3);
+plotmf(fis, 'output', 1);
+title('MF Output: servo');
+xlabel('servo'); ylabel('Degree of membership');
+legend({'NB','NS','ZO','PS','PB'}, 'Location', 'northwest');
+
+disp('Parameter Membership Function (MF) hasil optimasi:');
+for v = 1:2 % input
+    fprintf('\nInput %d (%s):\n', v, fis_opt.Inputs(v).Name);
+    for i = 1:5
+        fprintf('  %s: [%.4f %.4f %.4f]\n', ...
+            fis_opt.Inputs(v).MembershipFunctions(i).Name, ...
+            fis_opt.Inputs(v).MembershipFunctions(i).Parameters);
+    end
+end
+fprintf('\nOutput (%s):\n', fis_opt.Outputs(1).Name);
+for i = 1:5
+    fprintf('  %s: [%.4f %.4f %.4f]\n', ...
+        fis_opt.Outputs(1).MembershipFunctions(i).Name, ...
+        fis_opt.Outputs(1).MembershipFunctions(i).Parameters);
+end
+
+%% --- Fitness Function (inline, tidak perlu file terpisah) ---
+function rmse = FLC_GA_fitness(x, fis, delta_error, delta_lux, output_target)
+    fis_temp = fis;
+    idx = 1;
+    eps = 1e-3;
+    function params = valid_trimf(params)
+        params = sort(params);
+        if params(1) == params(2)
+            params(2) = params(1) + eps;
+        end
+        if params(2) == params(3)
+            params(3) = params(2) + eps;
+        end
+        if params(1) == params(3)
+            params(3) = params(1) + 2*eps;
+        end
+    end
+    for i=1:5
+        params = valid_trimf(x(idx:idx+2));
+        fis_temp.Inputs(1).MembershipFunctions(i).Parameters = params;
+        idx=idx+3;
+    end
+    for i=1:5
+        params = valid_trimf(x(idx:idx+2));
+        fis_temp.Inputs(2).MembershipFunctions(i).Parameters = params;
+        idx=idx+3;
+    end
+    for i=1:5
+        params = valid_trimf(x(idx:idx+2));
+        fis_temp.Outputs(1).MembershipFunctions(i).Parameters = params;
+        idx=idx+3;
+    end
+    output_pred = zeros(size(delta_error));
+    warning('off','all');
+    for i=1:length(delta_error)
+        output_pred(i) = evalfis(fis_temp, [delta_error(i), delta_lux(i)]);
+    end
+    warning('on','all');
+    % Bobot lebih besar untuk 20 data terakhir
+    w = ones(size(output_target));
+    w(end-19:end) = 5; % Bobot 5x untuk 20 data terakhir
+    rmse = sqrt(mean(w .* (output_pred - output_target).^2));
+end
