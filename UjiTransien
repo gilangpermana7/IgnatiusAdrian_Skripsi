@@ -1,0 +1,187 @@
+#include <Servo.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+// =====================
+// Konfigurasi Hardware
+// =====================
+#define LDR_LEFT   A0
+#define LDR_RIGHT  A1
+#define SERVO_PIN  9
+
+Servo myServo;
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// =====================
+// Variabel FLC
+// =====================
+#define DELTA_ERROR_MIN   -45
+#define DELTA_ERROR_MAX    45
+#define DELTA_ANGLE_MIN   -10
+#define DELTA_ANGLE_MAX    10
+
+// Membership Function Center
+const int NB = -1000; // Nilai dummy, hanya untuk index
+const int NS = -1;
+const int ZO =  0;
+const int PS =  1;
+const int PB =  2;
+
+// Sudut servo
+float servoAngle = 90.0; // Sudut awal (float untuk akurasi)
+int setpoint = 90;       // Setpoint awal
+
+// =====================
+// Fuzzy Membership Function
+// =====================
+float mf_tri(float x, float a, float b, float c) {
+  if (x <= a || x >= c) return 0;
+  else if (x == b) return 1;
+  else if (x < b) return (x - a) / (b - a);
+  else return (c - x) / (c - b);
+}
+
+void fuzzify_delta_error(float x, float* mf) {
+  mf[0] = mf_tri(x, -45, -45, -22.5);   // NB
+  mf[1] = mf_tri(x, -45, -22.5, 0);     // NS
+  mf[2] = mf_tri(x, -22.5, 0, 22.5);    // ZO
+  mf[3] = mf_tri(x, 0, 22.5, 45);       // PS
+  mf[4] = mf_tri(x, 22.5, 45, 45);      // PB
+}
+
+// Output FLC (delta sudut per update): -0.5, -0.25, 0, 0.25, 0.5 (sangat halus)
+const float outputMF[5] = { -0.5, -0.25, 0, 0.25, 0.5 };
+
+// Rule base untuk tracking setpoint (fokus pada delta_error saja)
+const int ruleBase[5] = {0, 1, 2, 3, 4}; // NB, NS, ZO, PS, PB
+
+float fuzzyController(float delta_error) {
+  float mf_error[5], output[5] = {0,0,0,0,0};
+ 
+  // Fuzzifikasi delta_error
+  fuzzify_delta_error(delta_error, mf_error);
+ 
+  // Inferensi (Mamdani)
+  for (int i = 0; i < 5; i++) {
+    if (mf_error[i] > output[i]) output[i] = mf_error[i];
+  }
+ 
+  // Defuzzifikasi (COG)
+  float num = 0, den = 0;
+  for (int k = 0; k < 5; k++) {
+    num += output[k] * outputMF[k];
+    den += output[k];
+  }
+  if (den == 0) return 0;
+  return num / den;
+}
+
+// =====================
+// Setup
+// =====================
+void setup() {
+  Serial.begin(9600);
+  myServo.attach(SERVO_PIN);
+  myServo.write(servoAngle);
+ 
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0,0); lcd.print("FLC Hybrid Track");
+  lcd.setCursor(0,1); lcd.print("Test Sequence");
+  delay(2000);
+  lcd.clear();
+ 
+  Serial.println("Time(s),Servo(deg),Setpoint,dErr,Step");
+}
+
+// =====================
+// Loop dengan Sampling Time 0.1 detik
+// =====================
+unsigned long lastUpdate = 0;
+const unsigned long samplingTime = 100; // 100 ms = 0.1 detik
+unsigned long startTime = 0;
+unsigned long lastSetpointChange = 0;
+const unsigned long setpointInterval = 3000; // 3 detik per step
+int stepCount = 0;
+
+// Sequence test: 90 -> 60 -> 90 -> 120 -> 90
+const int stepSequence[] = {90, 60, 90, 120, 90};
+const int numSteps = 5;
+
+void loop() {
+  unsigned long now = millis();
+  if (startTime == 0) startTime = now;
+ 
+  // Multiple step changes setiap 3 detik (hanya jika servo sudah mencapai target)
+  if (now - lastSetpointChange >= setpointInterval && stepCount < numSteps && abs(setpoint - servoAngle) < 0.5) {
+    setpoint = stepSequence[stepCount];
+    stepCount++;
+    lastSetpointChange = now;
+   
+    // Pertanda pergantian setpoint di Serial Monitor
+    Serial.print("*** SETPOINT BERUBAH: Step ");
+    Serial.print(stepCount-1);
+    Serial.print(" -> ");
+    Serial.print(setpoint);
+    Serial.println(" derajat ***");
+  }
+ 
+  // Sampling time 0.1 detik
+  if (now - lastUpdate >= samplingTime) {
+    lastUpdate = now;
+   
+    // 1. Hitung delta error (setpoint - sudut servo)
+    float delta_error = setpoint - servoAngle;
+   
+    // 2. Gerakan halus seperti kode test (increment 0.5 derajat)
+    if (abs(delta_error) > 0.5) {
+      if (delta_error > 0) {
+        servoAngle += 0.5; // Bergerak ke kanan
+      } else {
+        servoAngle -= 0.5; // Bergerak ke kiri
+      }
+    } else if (abs(delta_error) > 0.1) {
+      // Fine tuning untuk presisi
+      if (delta_error > 0) {
+        servoAngle += 0.1;
+      } else {
+        servoAngle -= 0.1;
+      }
+    }
+   
+    // Batasi range servo
+    if (servoAngle < 0) servoAngle = 0;
+    if (servoAngle > 180) servoAngle = 180;
+   
+    // Update servo
+    myServo.write((int)servoAngle);
+   
+    // 3. Tampilkan di LCD
+    lcd.setCursor(0,0);
+    lcd.print("S:");
+    lcd.print(servoAngle,1);
+    lcd.print((char)223);
+    lcd.print(" SP:");
+    lcd.print(setpoint);
+    lcd.setCursor(0,1);
+    lcd.print("dE:");
+    lcd.print(delta_error,1);
+    lcd.print(" Step:");
+    lcd.print(stepCount);
+    lcd.print("   ");
+   
+    // 4. Print ke Serial Monitor (format CSV untuk mudah di-plot)
+    float time_s = (now - startTime) / 1000.0;
+    Serial.print(time_s, 1);
+    Serial.print(",");
+    Serial.print(servoAngle, 2);
+    Serial.print(",");
+    Serial.print(setpoint);
+    Serial.print(",");
+    Serial.print(delta_error, 1);
+    Serial.print(",");
+    Serial.println(stepCount);
+  }
+ 
+  delay(100); // Sampling time 0.1 detik
+}
